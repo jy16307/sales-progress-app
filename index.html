@@ -109,6 +109,7 @@
             </div>
             <!-- 同時利用状態は画面切替後もヘッダーに固定表示する -->
             <div class="flex items-center space-x-2 mt-2 sm:mt-0">
+                <span id="syncStatus" class="text-[10px] text-slate-400" role="status" aria-live="polite">Supabase未接続</span>
                 <!-- 月の完了ボタン -->
                 <button onclick="completeCurrentMonth()" class="bg-amber-600 hover:bg-amber-500 text-white px-3 py-1.5 rounded text-xs font-semibold flex items-center shadow transition">
                     <i class="fa-solid fa-circle-check mr-1.5"></i> 当月を完了して次月へ
@@ -1081,6 +1082,20 @@
         const loginSubmit = document.getElementById('loginSubmit');
         const authLoading = document.getElementById('authLoading');
         const toolApp = document.getElementById('toolApp');
+        let authenticatedUser = null;
+        let appInitialized = false;
+        let remoteSyncReady = false;
+        let applyingRemoteState = false;
+        let realtimeChannel = null;
+        let remoteSyncTimer = null;
+        let remoteSyncQueue = Promise.resolve();
+        let realtimeRefreshTimer = null;
+        const remoteRowBaselines = {
+            projects: new Map(),
+            schedules: new Map(),
+            stages: new Map()
+        };
+        const remoteProjectIdByLocalId = new Map();
 
         function showAuthenticatedApp(isAuthenticated) {
             loginScreen.hidden = isAuthenticated;
@@ -1090,6 +1105,35 @@
             if (isAuthenticated && calendar) calendar.updateSize();
         }
 
+        function setSyncStatus(message, isError = false) {
+            const status = document.getElementById('syncStatus');
+            if (status) {
+                status.textContent = `Supabase: ${message}`;
+                status.className = `text-[10px] ${isError ? 'text-rose-400' : 'text-slate-400'}`;
+            }
+        }
+
+        async function startAuthenticatedApp(user) {
+            if (!supabaseClient) throw new Error('Supabase SDKを読み込めませんでした。');
+            authenticatedUser = user;
+            if (appInitialized) {
+                showAuthenticatedApp(true);
+                return;
+            }
+
+            setSyncStatus('データを読み込み中...');
+            loadSavedData();
+            await loadRemoteAppState();
+            initializeToolApp();
+            startRealtimeSubscription();
+            remoteSyncReady = true;
+            appInitialized = true;
+
+            await syncRemoteAppState();
+            setSyncStatus('接続中');
+            showAuthenticatedApp(true);
+        }
+
         document.addEventListener('DOMContentLoaded', async () => {
             try {
                 if (!supabaseClient) throw new Error('Supabase SDKを読み込めませんでした。');
@@ -1097,12 +1141,17 @@
                 if (error) throw error;
 
                 authLoading.hidden = true;
-                loginForm.hidden = Boolean(data.session);
-                showAuthenticatedApp(Boolean(data.session));
+                loginForm.hidden = !data.session;
+                if (data.session) {
+                    await startAuthenticatedApp(data.session.user);
+                } else {
+                    showAuthenticatedApp(false);
+                }
             } catch (error) {
                 authLoading.hidden = true;
                 loginForm.hidden = false;
-                loginMessage.textContent = `ログイン状態を確認できませんでした: ${error.message}`;
+                loginMessage.textContent = `ログイン状態または同期データを確認できませんでした: ${error.message}`;
+                setSyncStatus('エラー', true);
             }
         });
 
@@ -1114,16 +1163,17 @@
             try {
                 if (!supabaseClient) throw new Error('Supabase SDKを読み込めませんでした。');
                 const formData = new FormData(loginForm);
-                const { error } = await supabaseClient.auth.signInWithPassword({
+                const { data, error } = await supabaseClient.auth.signInWithPassword({
                     email: formData.get('email'),
                     password: formData.get('password')
                 });
                 if (error) throw error;
 
+                await startAuthenticatedApp(data.user);
                 loginForm.reset();
                 showAuthenticatedApp(true);
             } catch (error) {
-                loginMessage.textContent = `ログインに失敗しました: ${error.message}`;
+                loginMessage.textContent = `ログインまたは同期に失敗しました: ${error.message}`;
             } finally {
                 loginSubmit.disabled = false;
             }
@@ -1180,13 +1230,13 @@
             event.stopPropagation();
         }, true);
 
-        document.addEventListener('DOMContentLoaded', () => {
+        function initializeToolApp() {
             initFileDrop();
             renderTabs();
             renderDashboard();
             initCalendar();
             renderProjectScheduleList();
-        });
+        }
 
         function hasEditPermission() {
             return true;
@@ -1194,6 +1244,333 @@
 
         function requireEditPermission() {
             return true;
+        }
+
+        function createRemoteId() {
+            if (crypto.randomUUID) return crypto.randomUUID();
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, character => {
+                const random = Math.random() * 16 | 0;
+                return (character === 'x' ? random : (random & 0x3 | 0x8)).toString(16);
+            });
+        }
+
+        function stableJson(value) {
+            if (Array.isArray(value)) return `[${value.map(item => item === undefined ? 'null' : stableJson(item)).join(',')}]`;
+            if (value && typeof value === 'object') {
+                const keys = Object.keys(value).filter(key => value[key] !== undefined).sort();
+                return `{${keys.map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+            }
+            return JSON.stringify(value) ?? 'null';
+        }
+
+        function comparableRow(table, row) {
+            if (table !== 'projects') return row;
+            const comparable = { ...row };
+            delete comparable.created_at;
+            return comparable;
+        }
+
+        function createRowBaseline(table, rows) {
+            return new Map(rows.map(row => [row.id, stableJson(comparableRow(table, row))]));
+        }
+
+        async function loadRemoteAppState() {
+            const [projectsResult, schedulesResult, stagesResult, userResult] = await Promise.all([
+                supabaseClient.from('projects').select('id,name,status,user_id,month,payload,created_at'),
+                supabaseClient.from('schedules').select('id,project_id,user_id,member,title,start_date,end_date,payload'),
+                supabaseClient.from('stages').select('id,project_id,name,order_index,payload'),
+                supabaseClient.from('users').select('id,email,name,app_data').eq('id', authenticatedUser.id).maybeSingle()
+            ]);
+            for (const result of [projectsResult, schedulesResult, stagesResult, userResult]) {
+                if (result.error) throw result.error;
+            }
+
+            const projectRows = projectsResult.data || [];
+            const scheduleRows = schedulesResult.data || [];
+            const stageRows = stagesResult.data || [];
+            const userData = userResult.data?.app_data;
+            const hasInitializedUserData = userData?.initialized === true;
+            const nextDataset = Object.fromEntries(monthList.map(month => [month, []]));
+            const nextPersonalSchedules = {};
+            const projectByRemoteId = new Map();
+            const nextProjectIdByLocalId = new Map();
+            const localProjectEntries = Object.entries(dataset).flatMap(([month, projects]) =>
+                (projects || []).map(project => ({ month, project })));
+            const matchedLocalProjects = new Set();
+
+            projectRows.forEach((row, index) => {
+                const storedProject = row.payload?.project;
+                const localEntry = storedProject ? null : localProjectEntries.find(entry =>
+                    !matchedLocalProjects.has(entry.project) &&
+                    row.name &&
+                    [entry.project.project_name, entry.project.name, entry.project.note, entry.project.kikan_no]
+                        .some(value => value && value === row.name));
+                if (localEntry) matchedLocalProjects.add(localEntry.project);
+                const project = storedProject && typeof storedProject === 'object'
+                    ? { ...storedProject }
+                    : localEntry
+                        ? { ...localEntry.project }
+                        : {
+                            id: Date.now() + index,
+                            project_name: row.name || '',
+                            name: row.name || '',
+                            status: row.status || ''
+                        };
+                if (project.id === undefined || project.id === null) project.id = Date.now() + index;
+                if (row.name && (!localEntry || storedProject)) {
+                    project.project_name = row.name;
+                    if (project.name !== undefined) project.name = row.name;
+                }
+                if (row.status) {
+                    project.status = row.status;
+                    const percentage = row.status.match(/^(\d+(?:\.\d+)?)%$/);
+                    if (percentage) project.progress = Number(percentage[1]) / 100;
+                }
+                const month = monthList.includes(row.month) ? row.month : localEntry?.month || monthList[0];
+                project.supabase_id = row.id;
+                project.supabase_user_id = row.user_id;
+                nextDataset[month].push(project);
+                projectByRemoteId.set(row.id, project);
+                nextProjectIdByLocalId.set(String(project.id), row.id);
+            });
+
+            scheduleRows.forEach(row => {
+                const event = row.payload?.event && typeof row.payload.event === 'object'
+                    ? { ...row.payload.event }
+                    : {
+                        id: row.id,
+                        title: row.title || '',
+                        start: row.start_date || '',
+                        ...(row.end_date ? { end: row.end_date } : {})
+                    };
+                const member = row.payload?.member || row.member || '未割当';
+                if (row.title) event.title = row.title;
+                event.supabase_user_id = row.user_id;
+                if (row.start_date) {
+                    const timePart = typeof event.start === 'string' && event.start.length > 10 ? event.start.slice(10) : '';
+                    event.start = `${row.start_date}${timePart}`;
+                }
+                if (row.end_date) {
+                    const timePart = typeof event.end === 'string' && event.end.length > 10 ? event.end.slice(10) : '';
+                    event.end = `${row.end_date}${timePart}`;
+                }
+                event.supabase_id = row.id;
+                if (!nextPersonalSchedules[member]) nextPersonalSchedules[member] = [];
+                nextPersonalSchedules[member].push(event);
+            });
+
+            const nextProjectSchedules = {};
+            stageRows.forEach(row => {
+                const project = projectByRemoteId.get(row.project_id);
+                if (!project) return;
+                const stage = row.payload && typeof row.payload === 'object'
+                    ? { ...row.payload }
+                    : { name: row.name || '', order: row.order_index };
+                if (row.name) stage.name = row.name;
+                if (Number.isInteger(row.order_index)) stage.order = row.order_index;
+                stage.supabase_id = row.id;
+                const projectId = String(project.id);
+                if (!nextProjectSchedules[projectId]) nextProjectSchedules[projectId] = [];
+                nextProjectSchedules[projectId].push(stage);
+            });
+            Object.values(nextProjectSchedules).forEach(stages => {
+                stages.sort((left, right) => (Number(left.order) || 0) - (Number(right.order) || 0));
+            });
+
+            remoteRowBaselines.projects = createRowBaseline('projects', projectRows);
+            remoteRowBaselines.schedules = createRowBaseline('schedules', scheduleRows);
+            remoteRowBaselines.stages = createRowBaseline('stages', stageRows);
+            remoteProjectIdByLocalId.clear();
+            nextProjectIdByLocalId.forEach((remoteId, localId) => remoteProjectIdByLocalId.set(localId, remoteId));
+
+            if (projectRows.length || scheduleRows.length || stageRows.length || hasInitializedUserData) {
+                applyingRemoteState = true;
+                try {
+                    if (projectRows.length || hasInitializedUserData) dataset = nextDataset;
+                    if (stageRows.length || hasInitializedUserData) projectSchedules = nextProjectSchedules;
+                    if (scheduleRows.length) personalSchedules = nextPersonalSchedules;
+                    else if (hasInitializedUserData) personalSchedules = {};
+                    if (userData && Number.isInteger(userData.unlockedMonthIndex)) {
+                        unlockedMonthIndex = Math.max(0, Math.min(userData.unlockedMonthIndex, monthList.length - 1));
+                    }
+                    if (userData && (userData.currentMonth === 'summary' || monthList.includes(userData.currentMonth))) {
+                        currentMonth = userData.currentMonth;
+                    }
+                    projectScheduleAutoUpdateEnabled = userData?.projectScheduleAutoUpdateEnabled !== false;
+                    saveData();
+                } finally {
+                    applyingRemoteState = false;
+                }
+                if (appInitialized) renderAuthenticatedData();
+            }
+
+            return Boolean(projectRows.length || scheduleRows.length || stageRows.length || hasInitializedUserData);
+        }
+
+        function renderAuthenticatedData() {
+            renderTabs();
+            renderDashboard();
+            refreshCalendarEvents();
+            renderProjectScheduleList();
+            if (selectedProjectScheduleId !== null) renderProjectScheduleDetail(selectedProjectScheduleId);
+            if (calendar) calendar.updateSize();
+        }
+
+        function startRealtimeSubscription() {
+            if (!supabaseClient || realtimeChannel) return;
+            realtimeChannel = supabaseClient
+                .channel('sales-progress-realtime')
+                .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, scheduleRealtimeRefresh)
+                .on('postgres_changes', { event: '*', schema: 'public', table: 'schedules' }, scheduleRealtimeRefresh)
+                .on('postgres_changes', { event: '*', schema: 'public', table: 'stages' }, scheduleRealtimeRefresh)
+                .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, scheduleRealtimeRefresh)
+                .subscribe(status => {
+                    if (status === 'SUBSCRIBED') setSyncStatus('リアルタイム接続中');
+                    else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+                        setSyncStatus(`リアルタイム接続エラー (${status})`, true);
+                        console.error('Supabase Realtime の購読に失敗しました。', status);
+                    }
+                });
+        }
+
+        function scheduleRealtimeRefresh() {
+            clearTimeout(realtimeRefreshTimer);
+            realtimeRefreshTimer = setTimeout(async () => {
+                try {
+                    await loadRemoteAppState();
+                    setSyncStatus('リアルタイム同期中');
+                } catch (error) {
+                    setSyncStatus('受信エラー', true);
+                    console.error('Supabaseから最新データを取得できませんでした。', error);
+                }
+            }, 150);
+        }
+
+        function queueRemoteSync() {
+            if (!remoteSyncReady || applyingRemoteState || !authenticatedUser) return;
+            clearTimeout(remoteSyncTimer);
+            remoteSyncTimer = setTimeout(() => {
+                remoteSyncQueue = remoteSyncQueue
+                    .then(syncRemoteAppState)
+                    .catch(error => {
+                        setSyncStatus('保存エラー', true);
+                        console.error('Supabaseへの保存に失敗しました。', error);
+                    });
+            }, 250);
+        }
+
+        async function syncRemoteAppState() {
+            const activeProjects = [];
+            const activeSchedules = [];
+            const activeStages = [];
+            const activeProjectIds = new Set();
+            const activeScheduleIds = new Set();
+            const activeStageIds = new Set();
+
+            Object.entries(dataset).forEach(([month, projects]) => {
+                (projects || []).forEach(project => {
+                    const projectId = project.supabase_id || remoteProjectIdByLocalId.get(String(project.id)) || createRemoteId();
+                    project.supabase_id = projectId;
+                    project.supabase_user_id = project.supabase_user_id || authenticatedUser.id;
+                    project.created_at = project.created_at || new Date().toISOString();
+                    remoteProjectIdByLocalId.set(String(project.id), projectId);
+                    activeProjectIds.add(projectId);
+                    activeProjects.push({
+                        id: projectId,
+                        name: project.project_name || project.name || project.note || project.kikan_no || '',
+                        status: project.status || `${Math.round((Number(project.progress) || 0) * 100)}%`,
+                        user_id: project.supabase_user_id,
+                        month,
+                        payload: { project },
+                        created_at: project.created_at
+                    });
+
+                    const stages = projectSchedules[String(project.id)] || [];
+                    stages.forEach((stage, index) => {
+                        const stageId = stage.supabase_id || createRemoteId();
+                        stage.supabase_id = stageId;
+                        activeStageIds.add(stageId);
+                        activeStages.push({
+                            id: stageId,
+                            project_id: projectId,
+                            name: stage.name || '',
+                            order_index: Number(stage.order) || index + 1,
+                            payload: stage
+                        });
+                    });
+                });
+            });
+
+            Object.entries(personalSchedules).forEach(([member, events]) => {
+                (events || []).forEach(event => {
+                    const eventId = event.supabase_id || createRemoteId();
+                    event.supabase_id = eventId;
+                    activeScheduleIds.add(eventId);
+                    const projectId = event.projectId === undefined
+                        ? null
+                        : remoteProjectIdByLocalId.get(String(event.projectId)) || null;
+                    activeSchedules.push({
+                        id: eventId,
+                        project_id: projectId,
+                        user_id: event.supabase_user_id || authenticatedUser.id,
+                        member,
+                        title: event.title || '',
+                        start_date: event.start ? String(event.start).slice(0, 10) : null,
+                        end_date: event.end ? String(event.end).slice(0, 10) : null,
+                        payload: { member, event }
+                    });
+                });
+            });
+
+            const user = await supabaseClient.auth.getUser();
+            if (user.error) throw user.error;
+            const currentUser = user.data.user || authenticatedUser;
+            const userAppData = {
+                initialized: true,
+                unlockedMonthIndex,
+                currentMonth,
+                projectScheduleAutoUpdateEnabled
+            };
+
+            for (const [table, rows] of [
+                ['projects', activeProjects],
+                ['schedules', activeSchedules],
+                ['stages', activeStages]
+            ]) {
+                const changedRows = rows.filter(row =>
+                    remoteRowBaselines[table].get(row.id) !== stableJson(comparableRow(table, row)));
+                if (changedRows.length) {
+                    const { error } = await supabaseClient.from(table).upsert(changedRows, { onConflict: 'id' });
+                    if (error) throw error;
+                }
+            }
+            const { error: userError } = await supabaseClient.from('users').upsert({
+                id: currentUser.id,
+                email: currentUser.email || '',
+                name: currentUser.user_metadata?.name || currentUser.user_metadata?.full_name || currentUser.email || '',
+                app_data: userAppData
+            }, { onConflict: 'id' });
+            if (userError) throw userError;
+
+            await deleteRemovedRows('stages', remoteRowBaselines.stages, activeStageIds);
+            await deleteRemovedRows('schedules', remoteRowBaselines.schedules, activeScheduleIds);
+            await deleteRemovedRows('projects', remoteRowBaselines.projects, activeProjectIds);
+            remoteRowBaselines.projects = createRowBaseline('projects', activeProjects);
+            remoteRowBaselines.schedules = createRowBaseline('schedules', activeSchedules);
+            remoteRowBaselines.stages = createRowBaseline('stages', activeStages);
+            try {
+                localStorage.setItem(appStorageKey, JSON.stringify(createSavePayload()));
+            } catch (error) {
+                console.error('Supabase同期後のブラウザ内キャッシュを保存できませんでした。', error);
+            }
+            setSyncStatus('保存済み');
+        }
+
+        async function deleteRemovedRows(table, previousRows, activeIds) {
+            const removedIds = [...previousRows.keys()].filter(id => !activeIds.has(id));
+            if (!removedIds.length) return;
+            const { error } = await supabaseClient.from(table).delete().in('id', removedIds);
+            if (error) throw error;
         }
 
         function triggerGlobalUpdate() {
@@ -1217,6 +1594,7 @@
             if (!hasEditPermission()) return false;
             try {
                 localStorage.setItem(appStorageKey, JSON.stringify(createSavePayload()));
+                queueRemoteSync();
                 return true;
             } catch (error) {
                 console.error('ブラウザ内にデータを保存できませんでした。', error);
