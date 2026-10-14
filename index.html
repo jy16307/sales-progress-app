@@ -1116,22 +1116,25 @@
         async function startAuthenticatedApp(user) {
             if (!supabaseClient) throw new Error('Supabase SDKを読み込めませんでした。');
             authenticatedUser = user;
-            if (appInitialized) {
-                showAuthenticatedApp(true);
-                return;
+            if (!appInitialized) {
+                loadSavedData();
+                initializeToolApp();
+                appInitialized = true;
             }
 
-            setSyncStatus('データを読み込み中...');
-            loadSavedData();
-            await loadRemoteAppState();
-            initializeToolApp();
-            startRealtimeSubscription();
-            remoteSyncReady = true;
-            appInitialized = true;
-
-            await syncRemoteAppState();
-            setSyncStatus('接続中');
             showAuthenticatedApp(true);
+            setSyncStatus('Supabaseと同期中...');
+            loadRemoteAppState()
+                .then(() => {
+                    startRealtimeSubscription();
+                    remoteSyncReady = true;
+                    return syncRemoteAppState();
+                })
+                .then(() => setSyncStatus('リアルタイム同期中'))
+                .catch(error => {
+                    setSyncStatus(`同期エラー: ${error.message}`, true);
+                    console.error('Supabaseとの同期に失敗しました。ローカル画面は引き続き利用できます。', error);
+                });
         }
 
         document.addEventListener('DOMContentLoaded', async () => {
