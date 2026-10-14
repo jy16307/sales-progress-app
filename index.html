@@ -1141,7 +1141,7 @@
                 if (error) throw error;
 
                 authLoading.hidden = true;
-                loginForm.hidden = !data.session;
+                loginForm.hidden = Boolean(data.session);
                 if (data.session) {
                     await startAuthenticatedApp(data.session.user);
                 } else {
